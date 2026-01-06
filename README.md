@@ -8,10 +8,66 @@ In essence, ZFSBootMenu is a small, self-contained Linux system that knows how t
 
 ![screenshot](/media/v2.3.0-multi-be.png)
 
+## Remote SSH Access
+
+This fork includes enhanced remote SSH access support for headless servers and cloud environments:
+
+### ⚠️ Breaking Changes from Upstream
+
+| Change | Before (upstream) | After (this fork) |
+|--------|-------------------|-------------------|
+| **SSH Port** | 222 | **22** (standard SSH port) |
+| **SSH Timeout** | Indefinite wait | **30 seconds** (configurable) |
+| **Auto-launch** | Manual `zfsbootmenu` command | **Automatic** on SSH login |
+| **Network Config** | `ip=single-dhcp` (first interface only) | `ip=dhcp` (all interfaces) |
+
+### Critical Fixes
+
+- **RFC 3442 DHCP Fix**: Fixes dracut init loop on providers like Hetzner that use classless static routes
+  - Resolves `integer expression expected` and `shift count out of range` errors
+  - Patched `parse_option_121()` function with proper argument validation
+
+### Features
+
+- **SSH Connection Timeout**: Wait for SSH login before auto-boot (default: 30 seconds)
+- **Multi-NIC Support**: DHCP on all interfaces by default, or specify by MAC address
+- **RFC 3442 DHCP Fix**: Robust handling of classless static routes (works with Hetzner and similar providers)
+- **Race Condition Prevention**: Console waits when SSH user is connected
+
+### Quick Start
+
+```bash
+# Build ZBM with SSH support (uses DHCP on all interfaces)
+./contrib/remote-ssh-build.sh
+
+# Or specify a specific NIC by MAC address
+NET_MAC=aa:bb:cc:dd:ee:ff ./contrib/remote-ssh-build.sh
+
+# Override SSH timeout (default 30s, 0 = indefinite)
+SSH_TIMEOUT=60 ./contrib/remote-ssh-build.sh
+```
+
+### Kernel Command Line Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `zbm.ssh_timeout=N` | Wait N seconds for SSH login before auto-boot |
+| `ip=dhcp` | Enable DHCP on all interfaces (default) |
+| `ifname=eth0:<mac> ip=eth0:dhcp` | Use specific NIC by MAC address |
+
+### Repacking Existing Images
+
+Use `contrib/zbm-repack.sh` to add SSH keys to existing ZBM EFI or BIOS images:
+
+```bash
+sudo ./contrib/zbm-repack.sh -i vmlinuz.EFI -k ~/.ssh/authorized_keys
+```
+
 ### For more details, see:
 
 - [Documentation](https://docs.zfsbootmenu.org)
 - [Boot Environments and You: A Primer](https://docs.zfsbootmenu.org/en/latest/general/bootenvs-and-you.html)
+- [Remote Access Guide](https://docs.zfsbootmenu.org/en/latest/general/remote-access.html)
 
 ### Join us on IRC
 

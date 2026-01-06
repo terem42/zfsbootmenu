@@ -87,29 +87,78 @@ if [ "${zbm_ssh_timeout:-0}" -gt 0 ]; then
     _db_port=$( sed -n "s/.*dropbear_port='\([^']*\)'.*/\1/p" /etc/crypt-ssh.conf 2>/dev/null )
     echo "[SSH] Dropbear running on port ${_db_port:-222}"
     
-    # Show all interfaces with IPs (to verify multi-NIC)
-    echo "[SSH] Interfaces with IPs:"
-    ip -4 addr show scope global 2>/dev/null | grep -E 'inet |^[0-9]+:' | while read line; do
-      echo "[SSH]   $line"
+    # Show interfaces with IPs (condensed)
+    ip -4 addr show scope global 2>/dev/null | awk '/^[0-9]+:/ {iface=$2; gsub(/:$/,"",iface)} /inet / {print "[SSH]   " iface ": " $2}'
+    
+    # Apply RFC 3442 classless static routes directly from DHCP options
+    # The dracut hookdir scripts may not have run yet, so parse and apply routes ourselves
+    _total_routes=0
+    for dhcpfile in /tmp/dhclient.*.dhcpopts; do
+      if [ -f "$dhcpfile" ]; then
+        # Extract interface name from filename (e.g., /tmp/dhclient.eth1.dhcpopts -> eth1)
+        _iface="${dhcpfile#/tmp/dhclient.}"
+        _iface="${_iface%.dhcpopts}"
+        
+        # Source the DHCP options file to get variables
+        . "$dhcpfile" 2>/dev/null || continue
+        
+        if [ -n "$new_classless_static_routes" ]; then
+          _iface_routes=0
+          # Parse RFC 3442 format: mask dest_octets... gateway_octets
+          # Split on dots and spaces
+          set -- $( echo "$new_classless_static_routes" | tr '.' ' ' | tr "'" ' ' )
+          
+          while [ $# -ge 5 ]; do
+            _mask="$1"; shift
+            
+            # Validate mask is 0-32
+            case "$_mask" in ''|*[!0-9]*) break ;; esac
+            [ "$_mask" -gt 32 ] 2>/dev/null && break
+            
+            # Calculate destination octets needed
+            if [ "$_mask" -gt 24 ]; then _need=4
+            elif [ "$_mask" -gt 16 ]; then _need=3
+            elif [ "$_mask" -gt 8 ]; then _need=2
+            elif [ "$_mask" -gt 0 ]; then _need=1
+            else _need=0
+            fi
+            
+            # Check we have enough args (dest + 4 gateway octets)
+            [ $# -lt $(( _need + 4 )) ] && break
+            
+            # Build destination
+            case $_need in
+              4) _dest="$1.$2.$3.$4/$_mask"; shift 4 ;;
+              3) _dest="$1.$2.$3.0/$_mask"; shift 3 ;;
+              2) _dest="$1.$2.0.0/$_mask"; shift 2 ;;
+              1) _dest="$1.0.0.0/$_mask"; shift 1 ;;
+              0) _dest="0.0.0.0/$_mask" ;;
+            esac
+            
+            # Get gateway
+            _gw="$1.$2.$3.$4"; shift 4
+            
+            # Apply route and show it
+            if [ "$_gw" = "0.0.0.0" ]; then
+              echo "[SSH]   route: $_dest dev $_iface"
+              ip route replace "$_dest" dev "$_iface" 2>/dev/null || true
+            else
+              echo "[SSH]   route: $_dest via $_gw dev $_iface"
+              ip route replace "$_dest" via "$_gw" dev "$_iface" 2>/dev/null || true
+            fi
+          done
+        fi
+      fi
     done
     
-    # Check if dropbear is actually listening (try multiple methods)
-    if command -v ss >/dev/null 2>&1; then
-      _listen=$( ss -tlnp 2>/dev/null | grep ":${_db_port:-222}" )
-      echo "[SSH] Listening: ${_listen:-NOT LISTENING!}"
-    elif command -v netstat >/dev/null 2>&1; then
-      _listen=$( netstat -tlnp 2>/dev/null | grep ":${_db_port:-222}" )
-      echo "[SSH] Listening: ${_listen:-NOT LISTENING!}"
-    elif [ -f /proc/net/tcp ]; then
-      # Fallback: check /proc/net/tcp directly (port in hex, :0016 = 22, :00DE = 222)
+    # Verify dropbear is listening
+    if [ -f /proc/net/tcp ]; then
       _hex_port=$( printf '%04X' "${_db_port:-222}" )
       if grep -q ":${_hex_port} " /proc/net/tcp 2>/dev/null; then
-        echo "[SSH] Listening: yes (verified via /proc/net/tcp)"
+        echo "[SSH] Listening: yes"
       else
-        echo "[SSH] Listening: NOT FOUND in /proc/net/tcp!"
+        echo "[SSH] Listening: NOT FOUND!"
       fi
-    else
-      echo "[SSH] Cannot verify listening (no ss/netstat/proc)"
     fi
     
     echo "[SSH] Waiting ${zbm_ssh_timeout}s for SSH connection..."
