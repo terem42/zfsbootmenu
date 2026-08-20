@@ -231,9 +231,10 @@ if [ -f "${RS_SCRIPT_DIR}/network-hooks/dhclient-script.patched" ]; then
 	# Load rfc3442fix module (installs patched dhclient-script before network-legacy)
 	add_dracutmodules+=" rfc3442fix "
 EOF
+  # ",z" labels the volumes for SELinux-enforcing hosts; it is ignored elsewhere
   RS_NETFIX_MOUNTS=(
-    -O -v -O "${BUILD_DIR}/sbin/dhclient-script:/sbin/dhclient-script:ro"
-    -O -v -O "${BUILD_DIR}/dracut-modules/30rfc3442fix:/usr/lib/dracut/modules.d/30rfc3442fix:ro"
+    -O -v -O "${BUILD_DIR}/sbin/dhclient-script:/sbin/dhclient-script:ro,z"
+    -O -v -O "${BUILD_DIR}/dracut-modules/30rfc3442fix:/usr/lib/dracut/modules.d/30rfc3442fix:ro,z"
   )
   echo "Patched dhclient-script installed"
 else
@@ -267,7 +268,7 @@ done
 ZBM_SOURCE_DIR="$(cd "$(dirname "${ZBM_BUILDER}")" && pwd)"
 
 "${ZBM_BUILDER}" "${HELPER_ARGS[@]}" -b "${BUILD_DIR}" -l "${ZBM_SOURCE_DIR}" \
-  -O -v -O "${BUILD_DIR}/cmdline.d:/etc/cmdline.d:ro" \
+  -O -v -O "${BUILD_DIR}/cmdline.d:/etc/cmdline.d:ro,z" \
   "${RS_NETFIX_MOUNTS[@]}" \
   -- "${BUILDER_ARGS[@]}" -p dracut-crypt-ssh -p dropbear
 

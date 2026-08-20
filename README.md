@@ -63,6 +63,31 @@ Use `contrib/zbm-repack.sh` to add SSH keys to existing ZBM EFI or BIOS images:
 sudo ./contrib/zbm-repack.sh -i vmlinuz.EFI -k ~/.ssh/authorized_keys
 ```
 
+### Local Testing with QEMU/KVM
+
+Use `contrib/remote-ssh-lab.sh` to boot a freshly built image in a local VM and
+verify remote access before deploying to a real server. The VM is headless, so
+SSH is the only way in:
+
+```bash
+cd /path/to/build/dir            # the directory used for remote-ssh-build.sh
+/path/to/contrib/remote-ssh-lab.sh          # then: ssh -p 2222 root@localhost
+/path/to/contrib/remote-ssh-lab.sh -s       # with a serial console, to watch the boot
+/path/to/contrib/remote-ssh-lab.sh -t 30    # override zbm.ssh_timeout for one boot
+```
+
+The forwarded port is bound on all host interfaces, so the lab is also reachable
+from other machines. Note that QEMU's user-mode DHCP server does not send RFC
+3442 option 121; testing classless static routes requires a tap device and a
+DHCP server configured to supply them (see `-N`).
+
+On SELinux hosts, and when building with rootless podman, `remote-ssh-build.sh`
+may need:
+
+```bash
+./contrib/remote-ssh-build.sh -M z -O -e -O DRACUT_NO_XATTR=1
+```
+
 ### For more details, see:
 
 - [Documentation](https://docs.zfsbootmenu.org)
