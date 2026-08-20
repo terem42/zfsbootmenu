@@ -4,7 +4,8 @@
 ## REMOTE SSH LAB
 
 # Boot an image built by remote-ssh-build.sh in a local QEMU/KVM virtual
-# machine, so remote SSH access can be exercised without a real server.
+# machine, so remote SSH access can be exercised without a real server, and
+# tear the whole thing down again afterwards.
 #
 # The VM is headless by default -- no display, no console -- so the only way
 # in is SSH, exactly like a rented machine with no IPMI. A host port (2222 by
@@ -18,10 +19,11 @@
 # $BUILD_DIR at it:
 #
 # ```
-# ./remote-ssh-lab.sh              # headless; ssh -p 2222 root@localhost
-# ./remote-ssh-lab.sh -s           # attach a serial console to this terminal
+# ./remote-ssh-lab.sh              # boot; then: ssh -p 2222 root@localhost
+# ./remote-ssh-lab.sh -s           # boot with a serial console attached
 # ./remote-ssh-lab.sh -t 30        # override zbm.ssh_timeout for this boot
-# ./remote-ssh-lab.sh -e           # boot the EFI bundle instead of kernel+initramfs
+# ./remote-ssh-lab.sh -k           # stop the running lab VM
+# ./remote-ssh-lab.sh -K           # stop the VM and delete everything generated
 # ```
 #
 # The kernel command line baked into the image by remote-ssh-build.sh
@@ -33,14 +35,15 @@
 # An empty disk image is attached so ZFSBootMenu has something to scan. It
 # contains no pool, so ZBM will offer to initialize and then drop into its
 # recovery shell -- enough to confirm remote access works. To test a real
-# boot, attach a prepared pool image with -d instead.
+# boot, attach a prepared pool image with -d instead; a disk passed with -d
+# is never removed by -K.
 
 ## NOTE ON DHCP
 
 # QEMU's built-in user-mode DHCP server never sends RFC 3442 option 121, so
 # this lab does not exercise the classless-static-route path. Testing that
 # requires a tap device with a DHCP server configured to hand out classless
-# static routes (see docs or use -N to supply your own -netdev).
+# static routes; supply it with -N.
 
 BUILD_DIR=$(realpath "${BUILD_DIR:-${PWD}}")
 RS_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,21 +52,40 @@ SSH_PORT="${SSH_PORT:-2222}"
 MEMORY="${MEMORY:-2048M}"
 SMP="${SMP:-2}"
 
+RS_PIDFILE="${BUILD_DIR}/lab.pid"
+RS_SCRATCH="${BUILD_DIR}/lab-scratch.img"
+
+# Everything this script and remote-ssh-build.sh generate inside BUILD_DIR;
+# anything else found there is reported rather than removed
+RS_ARTIFACTS=(
+  build
+  dropbear
+  cmdline.d
+  dracut.conf.d
+  dracut-modules
+  sbin
+  lab-scratch.img
+  lab.pid
+)
+
 SERIAL=0
 USE_EFI=0
 TIMEOUT=""
 EXTRA_DISK=""
 NETDEV=""
+ACTION="up"
+ASSUME_YES=0
 
 usage() {
   cat <<-EOF
 	Usage: $0 [OPTIONS] [FLAGS]
 
-	  Boot a remote-ssh-build.sh image in a local KVM virtual machine
+	  Bring up, or tear down, a local KVM lab for a remote-ssh-build.sh image
 
 	OPTIONS
 	  -d <image>
-	     Attach this disk image instead of creating a scratch disk
+	     Attach this disk image instead of creating a scratch disk. A disk
+	     given here is never deleted by -K.
 
 	  -N <netdev>
 	     Use this qemu -netdev argument instead of user-mode networking
@@ -80,11 +102,146 @@ usage() {
 
 	  -s  Attach a serial console to this terminal (quit qemu with Ctrl-A X)
 
+	  -k  Stop a running lab VM and exit, leaving images and keys in place
+
+	  -K  Stop the VM, then delete everything generated in the build
+	      directory: images, scratch disk, dracut configuration and the
+	      dropbear host keys. Prompts first unless -y is given.
+
+	  -y  Assume "yes" for the -K confirmation prompt
+
 	  -h  Show this message and exit
 	EOF
 }
 
-while getopts "d:N:p:t:esh" opt; do
+# PIDs of qemu processes belonging to THIS build directory. Matching on the
+# build directory path keeps unrelated virtual machines on the same host --
+# libvirt guests, other labs -- out of the results.
+lab_pids() {
+  local _proc _pid _cmd
+  for _proc in /proc/[0-9]*; do
+    _pid="${_proc#/proc/}"
+    [ -r "${_proc}/cmdline" ] || continue
+    _cmd="$( tr '\0' ' ' < "${_proc}/cmdline" 2>/dev/null )"
+    case "${_cmd}" in
+      *qemu-system*"${BUILD_DIR}"*) echo "${_pid}" ;;
+    esac
+  done
+}
+
+stop_lab() {
+  local _pids _pid _waited
+  _pids="$( lab_pids )"
+
+  if [ -z "${_pids}" ]; then
+    echo "No running lab VM found for ${BUILD_DIR}"
+    rm -f "${RS_PIDFILE}"
+    return 0
+  fi
+
+  for _pid in ${_pids}; do
+    echo "Stopping lab VM (pid ${_pid})"
+    kill "${_pid}" 2>/dev/null || true
+  done
+
+  # Give qemu a chance to exit before resorting to SIGKILL
+  _waited=0
+  while [ "${_waited}" -lt 10 ]; do
+    [ -z "$( lab_pids )" ] && break
+    sleep 1
+    _waited=$(( _waited + 1 ))
+  done
+
+  for _pid in $( lab_pids ); do
+    echo "VM (pid ${_pid}) did not exit; sending SIGKILL"
+    kill -9 "${_pid}" 2>/dev/null || true
+  done
+
+  rm -f "${RS_PIDFILE}"
+  return 0
+}
+
+destroy_lab() {
+  local _item _present=() _leftover=() _reply _pids
+
+  for _item in "${RS_ARTIFACTS[@]}"; do
+    [ -e "${BUILD_DIR}/${_item}" ] && _present+=( "${_item}" )
+  done
+
+  _pids="$( lab_pids )"
+
+  if [ "${#_present[@]}" -eq 0 ] && [ -z "${_pids}" ]; then
+    echo "Nothing to remove in ${BUILD_DIR}, and no VM running"
+    return 0
+  fi
+
+  # Nothing is stopped or deleted until the plan below is confirmed
+  if [ -n "${_pids}" ]; then
+    echo
+    echo "About to stop the running lab VM:"
+    for _item in ${_pids}; do
+      echo "  pid ${_item}"
+    done
+  fi
+
+  echo
+  echo "About to delete from ${BUILD_DIR}:"
+  for _item in "${_present[@]}"; do
+    case "${_item}" in
+      dropbear) echo "  ${_item}  (SSH host keys and authorized_keys)" ;;
+      build) echo "  ${_item}  (kernel, initramfs and EFI bundle)" ;;
+      *) echo "  ${_item}" ;;
+    esac
+  done
+
+  # Anything not generated by these scripts stays; just say what is there
+  while IFS= read -r _item; do
+    _item="${_item#./}"
+    case " ${RS_ARTIFACTS[*]} " in
+      *" ${_item} "*) ;;
+      *) _leftover+=( "${_item}" ) ;;
+    esac
+  done < <( cd "${BUILD_DIR}" && find . -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null )
+
+  if [ "${#_leftover[@]}" -gt 0 ]; then
+    echo
+    echo "Leaving alone (not generated by these scripts):"
+    for _item in "${_leftover[@]}"; do
+      echo "  ${_item}"
+    done
+  fi
+
+  if ! ((ASSUME_YES)); then
+    if [ ! -t 0 ]; then
+      echo
+      echo "ERROR: refusing to delete without confirmation; re-run with -y"
+      return 1
+    fi
+    echo
+    printf 'Proceed? [y/N] '
+    read -r _reply
+    case "${_reply}" in
+      y|Y|yes|YES) ;;
+      *) echo "Aborted; the VM is still running and nothing was deleted"; return 1 ;;
+    esac
+  fi
+
+  stop_lab
+
+  for _item in "${_present[@]}"; do
+    rm -rf -- "${BUILD_DIR:?}/${_item}"
+  done
+
+  echo "Removed $(( ${#_present[@]} )) item(s) from ${BUILD_DIR}"
+  echo "The build directory itself was kept; remove it with: rmdir ${BUILD_DIR}"
+  echo
+  echo "Not touched by this script:"
+  echo "  the zbm-builder container image (podman rmi ghcr.io/zbm-dev/zbm-builder:latest)"
+  echo "  any 'Host' entry you added to ~/.ssh/config for this lab"
+  return 0
+}
+
+while getopts "d:N:p:t:eskKyh" opt; do
   case "${opt}" in
     d) EXTRA_DISK="${OPTARG}" ;;
     N) NETDEV="${OPTARG}" ;;
@@ -92,10 +249,18 @@ while getopts "d:N:p:t:esh" opt; do
     t) TIMEOUT="${OPTARG}" ;;
     e) USE_EFI=1 ;;
     s) SERIAL=1 ;;
+    k) ACTION="stop" ;;
+    K) ACTION="destroy" ;;
+    y) ASSUME_YES=1 ;;
     h) usage; exit 0 ;;
     *) usage; exit 1 ;;
   esac
 done
+
+case "${ACTION}" in
+  stop) stop_lab; exit $? ;;
+  destroy) destroy_lab; exit $? ;;
+esac
 
 # zbm-builder writes its output to a "build" subdirectory of the build directory
 RS_IMGDIR="${BUILD_DIR}/build"
@@ -143,7 +308,7 @@ if [ -n "${EXTRA_DISK}" ]; then
     exit 1
   fi
 else
-  RS_DISK="${BUILD_DIR}/lab-scratch.img"
+  RS_DISK="${RS_SCRATCH}"
   if [ ! -f "${RS_DISK}" ]; then
     truncate -s 5G "${RS_DISK}" || exit 1
     echo "Created scratch disk ${RS_DISK}"
@@ -195,8 +360,12 @@ else
       echo "  ssh -p ${SSH_PORT} root@${_addr%%/*}   (via ${_if%:})"
     done < <( ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}' )
   fi
-  echo "Stop the VM with: pkill -f 'qemu.*${RS_DISK##*/}'"
+  echo "Stop it with:    ${BASH_SOURCE[0]} -k"
+  echo "Tear it down:    ${BASH_SOURCE[0]} -K"
 fi
+
+# exec replaces this shell, so qemu inherits its PID -- record it first
+echo "$$" > "${RS_PIDFILE}"
 
 exec qemu-system-x86_64 \
   "${BFILES[@]}" \

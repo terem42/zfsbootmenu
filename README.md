@@ -76,6 +76,18 @@ cd /path/to/build/dir            # the directory used for remote-ssh-build.sh
 /path/to/contrib/remote-ssh-lab.sh -t 30    # override zbm.ssh_timeout for one boot
 ```
 
+The same script tears the lab down again. `-k` stops the VM but keeps the images
+and keys for the next boot; `-K` stops it and deletes everything the build and
+lab scripts generated, including the dropbear host keys. It lists what it will
+remove and prompts first (`-y` skips the prompt), leaves any file it did not
+create alone, and only ever touches virtual machines belonging to this build
+directory:
+
+```bash
+/path/to/contrib/remote-ssh-lab.sh -k       # stop the VM
+/path/to/contrib/remote-ssh-lab.sh -K       # stop it and delete generated files
+```
+
 The forwarded port is bound on all host interfaces, so the lab is also reachable
 from other machines. Note that QEMU's user-mode DHCP server does not send RFC
 3442 option 121; testing classless static routes requires a tap device and a
