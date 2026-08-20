@@ -84,9 +84,16 @@ create alone, and only ever touches virtual machines belonging to this build
 directory:
 
 ```bash
+/path/to/contrib/remote-ssh-lab.sh -c       # reprint the ssh command to use
 /path/to/contrib/remote-ssh-lab.sh -k       # stop the VM
 /path/to/contrib/remote-ssh-lab.sh -K       # stop it and delete generated files
 ```
+
+Booting prints a ready-to-paste `ssh` command, including `-i` for whichever
+private key the image's `authorized_keys` actually accepts (found by comparing
+key fingerprints) and the options that skip host-key caching, since the image's
+dropbear host keys are regenerated on every build. `-c` reprints it later.
+Nothing is ever written to `~/.ssh`.
 
 The forwarded port is bound on all host interfaces, so the lab is also reachable
 from other machines. Note that QEMU's user-mode DHCP server does not send RFC
