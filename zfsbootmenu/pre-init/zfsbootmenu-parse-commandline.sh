@@ -128,19 +128,20 @@ else
 fi
 
 # zbm.ssh_timeout= sets how long to wait for SSH login before auto-boot
+# 0 waits indefinitely; when the argument is absent, no SSH wait is performed
 # Only relevant when dropbear/SSH is enabled in the image
 # shellcheck disable=SC2034
-zbm_ssh_timeout=0
+zbm_ssh_timeout=""
 if ssh_timeout=$( get_zbm_arg zbm.ssh_timeout ) ; then
   if [ "${ssh_timeout}" -ge 0 ] >/dev/null 2>&1; then
     zbm_ssh_timeout="${ssh_timeout}"
     if [ "${zbm_ssh_timeout}" -gt 0 ]; then
       zinfo "SSH timeout set to ${zbm_ssh_timeout} seconds"
     else
-      zinfo "SSH timeout disabled"
+      zinfo "SSH wait enabled with no timeout (wait indefinitely)"
     fi
   else
-    zwarn "invalid SSH timeout: '${ssh_timeout}', disabling SSH timeout"
+    zwarn "invalid SSH timeout: '${ssh_timeout}', disabling SSH wait"
   fi
 fi
 

@@ -237,7 +237,10 @@ case $reason in
             if [ -n "$new_classless_static_routes" ]; then
                 OLDIFS="$IFS"
                 IFS=".$IFS"
-                parse_option_121 "$new_classless_static_routes"
+                # The expansion must stay unquoted: the modified IFS splits the
+                # option value into individual octet arguments for the parser
+                # shellcheck disable=SC2086
+                parse_option_121 $new_classless_static_routes
                 IFS="$OLDIFS"
             fi
             echo "source_hook initqueue/online $netif"

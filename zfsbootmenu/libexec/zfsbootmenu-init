@@ -56,11 +56,11 @@ esac
 
 unset ZFSBOOTMENU_CONSOLE
 
-# SSH connection timeout: wait for SSH login before auto-boot
-# If zbm_ssh_timeout is positive, wait that many seconds for an SSH login
+# SSH wait: hold the console for an SSH login before auto-boot
+# zbm_ssh_timeout unset/empty: no SSH wait; N > 0: wait N seconds; 0: wait indefinitely
 # If someone logs in via SSH, the lock file will be created and we skip auto-boot
 # shellcheck disable=SC2154
-if [ "${zbm_ssh_timeout:-0}" -gt 0 ]; then
+if [ -n "${zbm_ssh_timeout}" ] && [ "${zbm_ssh_timeout}" -ge 0 ] 2>/dev/null; then
   echo "[SSH] Waiting for network..."
   
   # Wait for network to come up (max 10 seconds)
@@ -69,6 +69,7 @@ if [ "${zbm_ssh_timeout:-0}" -gt 0 ]; then
     if ip -4 addr show scope global 2>/dev/null | grep -q 'inet '; then
       _ip_addr=$( ip -4 addr show scope global 2>/dev/null | grep 'inet ' | head -1 | awk '{print $2}' )
       echo "[SSH] Network up: ${_ip_addr}"
+      zinfo "SSH wait: network up (${_ip_addr})"
       break
     fi
     echo "[SSH] Waiting for IP... (${_net_wait}/10)"
@@ -78,6 +79,7 @@ if [ "${zbm_ssh_timeout:-0}" -gt 0 ]; then
   
   if [ "${_net_wait}" -ge 10 ]; then
     echo "[SSH] WARN: Network not ready after 10s"
+    zwarn "SSH wait: network not ready after 10s"
   fi
   unset _net_wait _ip_addr
   
@@ -90,86 +92,47 @@ if [ "${zbm_ssh_timeout:-0}" -gt 0 ]; then
     # Show interfaces with IPs (condensed)
     ip -4 addr show scope global 2>/dev/null | awk '/^[0-9]+:/ {iface=$2; gsub(/:$/,"",iface)} /inet / {print "[SSH]   " iface ": " $2}'
     
-    # Apply RFC 3442 classless static routes directly from DHCP options
-    # The dracut hookdir scripts may not have run yet, so parse and apply routes ourselves
-    _total_routes=0
-    for dhcpfile in /tmp/dhclient.*.dhcpopts; do
-      if [ -f "$dhcpfile" ]; then
-        # Extract interface name from filename (e.g., /tmp/dhclient.eth1.dhcpopts -> eth1)
-        _iface="${dhcpfile#/tmp/dhclient.}"
-        _iface="${_iface%.dhcpopts}"
-        
-        # Source the DHCP options file to get variables
-        . "$dhcpfile" 2>/dev/null || continue
-        
-        if [ -n "$new_classless_static_routes" ]; then
-          _iface_routes=0
-          # Parse RFC 3442 format: mask dest_octets... gateway_octets
-          # Split on dots and spaces
-          set -- $( echo "$new_classless_static_routes" | tr '.' ' ' | tr "'" ' ' )
-          
-          while [ $# -ge 5 ]; do
-            _mask="$1"; shift
-            
-            # Validate mask is 0-32
-            case "$_mask" in ''|*[!0-9]*) break ;; esac
-            [ "$_mask" -gt 32 ] 2>/dev/null && break
-            
-            # Calculate destination octets needed
-            if [ "$_mask" -gt 24 ]; then _need=4
-            elif [ "$_mask" -gt 16 ]; then _need=3
-            elif [ "$_mask" -gt 8 ]; then _need=2
-            elif [ "$_mask" -gt 0 ]; then _need=1
-            else _need=0
-            fi
-            
-            # Check we have enough args (dest + 4 gateway octets)
-            [ $# -lt $(( _need + 4 )) ] && break
-            
-            # Build destination
-            case $_need in
-              4) _dest="$1.$2.$3.$4/$_mask"; shift 4 ;;
-              3) _dest="$1.$2.$3.0/$_mask"; shift 3 ;;
-              2) _dest="$1.$2.0.0/$_mask"; shift 2 ;;
-              1) _dest="$1.0.0.0/$_mask"; shift 1 ;;
-              0) _dest="0.0.0.0/$_mask" ;;
-            esac
-            
-            # Get gateway
-            _gw="$1.$2.$3.$4"; shift 4
-            
-            # Apply route and show it
-            if [ "$_gw" = "0.0.0.0" ]; then
-              echo "[SSH]   route: $_dest dev $_iface"
-              ip route replace "$_dest" dev "$_iface" 2>/dev/null || true
-            else
-              echo "[SSH]   route: $_dest via $_gw dev $_iface"
-              ip route replace "$_dest" via "$_gw" dev "$_iface" 2>/dev/null || true
-            fi
-          done
-        fi
-      fi
+    # RFC 3442 classless static routes are installed per-interface by the
+    # patched dhclient-script at DHCP BOUND time; show the resulting table
+    ip -4 route show 2>/dev/null | while read -r _route; do
+      echo "[SSH]   route: ${_route}"
     done
-    
-    # Verify dropbear is listening
-    if [ -f /proc/net/tcp ]; then
-      _hex_port=$( printf '%04X' "${_db_port:-222}" )
-      if grep -q ":${_hex_port} " /proc/net/tcp 2>/dev/null; then
+
+    # Verify dropbear is listening; check both the IPv4 and IPv6 socket
+    # tables, since a dual-stack listener appears only in /proc/net/tcp6
+    _hex_port=$( printf '%04X' "${_db_port:-222}" )
+    _tcpfiles=""
+    [ -f /proc/net/tcp ] && _tcpfiles="/proc/net/tcp"
+    [ -f /proc/net/tcp6 ] && _tcpfiles="${_tcpfiles} /proc/net/tcp6"
+    if [ -n "${_tcpfiles}" ]; then
+      # Field 2 is the local address ("hexip:hexport"); anchoring there avoids
+      # false matches on the remote-address column
+      # shellcheck disable=SC2086
+      if awk -v p=":${_hex_port}" '$2 ~ p"$" { found=1 } END { exit !found }' ${_tcpfiles} 2>/dev/null; then
         echo "[SSH] Listening: yes"
       else
         echo "[SSH] Listening: NOT FOUND!"
+        zwarn "dropbear not listening on port ${_db_port:-222}"
       fi
+    else
+      echo "[SSH] Cannot verify listening state"
     fi
     
-    echo "[SSH] Waiting ${zbm_ssh_timeout}s for SSH connection..."
-    zinfo "Waiting ${zbm_ssh_timeout}s for SSH connection..."
-    
+    if [ "${zbm_ssh_timeout}" -gt 0 ]; then
+      echo "[SSH] Waiting ${zbm_ssh_timeout}s for SSH connection..."
+      zinfo "Waiting ${zbm_ssh_timeout}s for SSH connection..."
+    else
+      echo "[SSH] Waiting for SSH connection (no timeout)..."
+      zinfo "Waiting for SSH connection (no timeout)..."
+    fi
+
     # Clean up any stale ssh_connected marker from previous boot
     rm -f "${BASE}/ssh_connected" 2>/dev/null || true
-    
+
     _ssh_waited=0
     _ssh_connected=0
-    while [ "${_ssh_waited}" -lt "${zbm_ssh_timeout}" ]; do
+    _db_hits=0
+    while [ "${zbm_ssh_timeout}" -eq 0 ] || [ "${_ssh_waited}" -lt "${zbm_ssh_timeout}" ]; do
       # Check if someone has SSH'd in - multiple detection methods:
       
       # Method 1: Check for active lock file (created when zfsbootmenu runs)
@@ -188,9 +151,18 @@ if [ "${zbm_ssh_timeout:-0}" -gt 0 ]; then
       fi
       
       # Method 3: Count dropbear processes (more than 1 means someone connected)
-      # When a connection comes in, dropbear forks a child process
-      _db_count=$( pgrep -c -x dropbear 2>/dev/null || echo 0 )
-      if [ "${_db_count}" -gt 1 ]; then
+      # When a connection comes in, dropbear forks a child process. Require two
+      # consecutive samples so short-lived probes (port scans, monitoring
+      # checks) don't register as a login.
+      # NOTE: pgrep -c prints the count even when it is 0; adding "|| echo 0"
+      # would append a second line and break the numeric comparison
+      _db_count=$( pgrep -c -x dropbear 2>/dev/null )
+      if [ "${_db_count:-0}" -gt 1 ]; then
+        _db_hits=$(( _db_hits + 1 ))
+      else
+        _db_hits=0
+      fi
+      if [ "${_db_hits}" -ge 2 ]; then
         echo "[SSH] Login detected! (${_db_count} dropbear processes)"
         zinfo "SSH login detected, cancelling auto-boot timeout"
         # Create a marker to indicate SSH user has control
@@ -198,16 +170,36 @@ if [ "${zbm_ssh_timeout:-0}" -gt 0 ]; then
         _ssh_connected=1
         break
       fi
-      
+
       sleep 1
       _ssh_waited=$(( _ssh_waited + 1 ))
-      
+
       # Show countdown every 5 seconds
       if [ $(( _ssh_waited % 5 )) -eq 0 ]; then
-        echo "[SSH] Waiting... ${_ssh_waited}/${zbm_ssh_timeout}s"
+        if [ "${zbm_ssh_timeout}" -gt 0 ]; then
+          echo "[SSH] Waiting... ${_ssh_waited}/${zbm_ssh_timeout}s"
+        else
+          echo "[SSH] Waiting... ${_ssh_waited}s"
+        fi
       fi
     done
     
+    # A connection may have completed after the last poll; re-check once
+    # before treating the wait as timed out
+    if [ "${_ssh_connected}" -eq 0 ]; then
+      if [ -e "${BASE}/active" ] || [ -e "${BASE}/ssh_connected" ]; then
+        _ssh_connected=1
+      else
+        _db_count=$( pgrep -c -x dropbear 2>/dev/null )
+        if [ "${_db_count:-0}" -gt 1 ]; then
+          echo "[SSH] Login detected! (${_db_count} dropbear processes)"
+          zinfo "SSH login detected, cancelling auto-boot timeout"
+          : > "${BASE}/ssh_connected"
+          _ssh_connected=1
+        fi
+      fi
+    fi
+
     # If SSH user connected, wait until they disconnect (don't run ZBM on console)
     if [ "${_ssh_connected}" -eq 1 ]; then
       echo "[SSH] User connected via SSH, console waiting..."
@@ -218,8 +210,8 @@ if [ "${zbm_ssh_timeout:-0}" -gt 0 ]; then
         [ -e "${BASE}/active" ] && { sleep 2; continue; }
         # If ssh_connected marker exists and more than 1 dropbear, still connected
         if [ -e "${BASE}/ssh_connected" ]; then
-          _db_count=$( pgrep -c -x dropbear 2>/dev/null || echo 0 )
-          if [ "${_db_count}" -gt 1 ]; then
+          _db_count=$( pgrep -c -x dropbear 2>/dev/null )
+          if [ "${_db_count:-0}" -gt 1 ]; then
             sleep 2
             continue
           fi
@@ -230,13 +222,14 @@ if [ "${zbm_ssh_timeout:-0}" -gt 0 ]; then
         break
       done
       echo "[SSH] SSH session ended, console resuming control"
-    elif [ "${_ssh_waited}" -ge "${zbm_ssh_timeout}" ]; then
+      zinfo "SSH session ended, console resuming control"
+    else
       echo "[SSH] Timeout expired, no SSH connection"
-      zinfo "SSH timeout expired (${zbm_ssh_timeout}s), stopping dropbear and proceeding with auto-boot"
-      # Stop dropbear to prevent late SSH connections from interfering with auto-boot
-      pkill -x dropbear 2>/dev/null || true
+      zinfo "SSH timeout expired (${zbm_ssh_timeout}s), proceeding with auto-boot"
+      # Dropbear is intentionally left running: if the boot fails into the
+      # recovery shell, SSH remains the only way into a headless box
     fi
-    unset _ssh_waited _db_count _ssh_connected
+    unset _ssh_waited _db_count _db_hits _ssh_connected _db_port _hex_port _tcpfiles
   else
     zinfo "SSH timeout configured but dropbear not running, skipping"
   fi

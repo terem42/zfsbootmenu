@@ -51,7 +51,7 @@ SSH_TIMEOUT=60 ./contrib/remote-ssh-build.sh
 
 | Parameter | Description |
 |-----------|-------------|
-| `zbm.ssh_timeout=N` | Wait N seconds for SSH login before auto-boot |
+| `zbm.ssh_timeout=N` | Wait N seconds for SSH login before auto-boot; `0` waits indefinitely; omit the parameter to skip the SSH wait entirely |
 | `ip=dhcp` | Enable DHCP on all interfaces (default) |
 | `ifname=eth0:<mac> ip=eth0:dhcp` | Use specific NIC by MAC address |
 

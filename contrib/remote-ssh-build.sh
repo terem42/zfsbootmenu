@@ -188,6 +188,10 @@ if [ ! -f "${RS_DNC}" ]; then
   echo "SSH timeout: ${SSH_TIMEOUT:-30} seconds"
   
   echo "${RS_NET_ARGS}" > "${RS_DNC}"
+else
+  echo "WARNING: reusing existing ${RS_DNC}"
+  echo "WARNING: NET_MAC, NET_IFACE and SSH_TIMEOUT are ignored for this build;"
+  echo "WARNING: delete ${RS_DNC} and re-run to apply new network settings"
 fi
 
 # Generated config file, not user customizable
@@ -209,6 +213,7 @@ done
 # arguments, causing errors on networks like Hetzner. This installs a patched version.
 # We use a dracut module with prefix 30 to load BEFORE 35network-legacy.
 RS_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RS_NETFIX_MOUNTS=( )
 if [ -f "${RS_SCRIPT_DIR}/network-hooks/dhclient-script.patched" ]; then
   # Copy patched script to sbin directory (mounted at /sbin/dhclient-script in container)
   mkdir -p "${BUILD_DIR}/sbin"
@@ -226,7 +231,14 @@ if [ -f "${RS_SCRIPT_DIR}/network-hooks/dhclient-script.patched" ]; then
 	# Load rfc3442fix module (installs patched dhclient-script before network-legacy)
 	add_dracutmodules+=" rfc3442fix "
 EOF
+  RS_NETFIX_MOUNTS=(
+    -O -v -O "${BUILD_DIR}/sbin/dhclient-script:/sbin/dhclient-script:ro"
+    -O -v -O "${BUILD_DIR}/dracut-modules/30rfc3442fix:/usr/lib/dracut/modules.d/30rfc3442fix:ro"
+  )
   echo "Patched dhclient-script installed"
+else
+  echo "WARNING: ${RS_SCRIPT_DIR}/network-hooks/dhclient-script.patched not found;"
+  echo "WARNING: building WITHOUT the RFC 3442 DHCP fix (classless static routes may break)"
 fi
 
 ## ZBM BUILDING
@@ -256,7 +268,6 @@ ZBM_SOURCE_DIR="$(cd "$(dirname "${ZBM_BUILDER}")" && pwd)"
 
 "${ZBM_BUILDER}" "${HELPER_ARGS[@]}" -b "${BUILD_DIR}" -l "${ZBM_SOURCE_DIR}" \
   -O -v -O "${BUILD_DIR}/cmdline.d:/etc/cmdline.d:ro" \
-  -O -v -O "${BUILD_DIR}/sbin/dhclient-script:/sbin/dhclient-script:ro" \
-  -O -v -O "${BUILD_DIR}/dracut-modules/30rfc3442fix:/usr/lib/dracut/modules.d/30rfc3442fix:ro" \
+  "${RS_NETFIX_MOUNTS[@]}" \
   -- "${BUILDER_ARGS[@]}" -p dracut-crypt-ssh -p dropbear
 
